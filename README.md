@@ -7,6 +7,8 @@ Read Claude Code sessions in Emacs and send prompts to them through tmux.
 > no reviewed PRs. Fork it, use it and change it as you like (MIT). Adapting it
 > to your setup is easy these days: fork it and ask an AI to do it.
 
+See every feature in screenshots: [claudy-tour](https://danielhvs.github.io/daniel-claudy/daniel-claudy-tour.html).
+
 Put `daniel-claudy.el` in `~/.emacs.d/daniel-claudy/`, then:
 
 ```elisp
