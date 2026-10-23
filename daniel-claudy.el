@@ -851,12 +851,51 @@ wrong, once that session exited and another claude took its pane."
                  daniel-claudy--pane)
             (daniel-claudy--select-pane))))
 
+(defun daniel-claudy--herdr-terminal-pid ()
+  "Return the pid of the terminal app showing the herdr client, or nil.
+The client is the herdr process on a tty; its ancestor just below launchd is
+the app that opened that tty."
+  (when-let* ((client (seq-find (lambda (pid)
+                                  (let ((a (process-attributes pid)))
+                                    (and (equal (alist-get 'comm a) "herdr")
+                                         (alist-get 'ttname a))))
+                                (list-system-processes))))
+    (let ((pid client)
+          (ppid (alist-get 'ppid (process-attributes client))))
+      (while (and ppid (> ppid 1))
+        (setq pid ppid
+              ppid (alist-get 'ppid (process-attributes pid))))
+      pid)))
+
+(defun daniel-claudy--raise-terminal ()
+  "Bring the terminal app showing the herdr client to the front.
+Finds it by pid, so a second window of the same app, a throwaway shell say,
+does not get raised in its place."
+  ;; ponytail: macOS only; add an xdotool/wmctrl branch for Linux if needed
+  (when-let* (((eq system-type 'darwin))
+              (pid (daniel-claudy--herdr-terminal-pid)))
+    (call-process "osascript" nil nil nil "-e"
+                  (format "tell application \"System Events\" to set frontmost \
+of (first application process whose unix id is %d) to true" pid))))
+
+(defun daniel-claudy--focus (pane)
+  "Switch herdr to PANE and bring its terminal to the front."
+  (daniel-claudy--herdr "agent" "focus" pane)
+  (daniel-claudy--raise-terminal))
+
 (defun daniel-claudy-focus-pane ()
-  "Focus the session's herdr workspace, tab and pane.
-Switches the herdr client; bringing the terminal itself to the front is up to
-your window manager."
+  "Focus the session's herdr workspace, tab and pane, terminal and all."
   (interactive)
-  (daniel-claudy--herdr "agent" "focus" (daniel-claudy--pane)))
+  (daniel-claudy--focus (daniel-claudy--pane)))
+
+;;;###autoload
+(defun daniel-claudy-focus-project-session (&optional reconnect)
+  "Switch to the Claude session linked to the current project, in herdr.
+Works from any buffer: the herdr client is brought to the front, showing the
+session's pane.  Connects first when the project has no link yet, as
+`daniel-claudy-send-selection' does, RECONNECT included."
+  (interactive "P")
+  (daniel-claudy--focus (daniel-claudy--project-pane reconnect)))
 
 (defun daniel-claudy--send-text (pane text &optional quiet)
   "Submit TEXT to the Claude session in herdr PANE.
@@ -883,19 +922,41 @@ in the echo area."
   (unless quiet
     (message "Sent to herdr %s:\n%s" pane text)))
 
-(defun daniel-claudy--selection-text ()
-  "Return the selected text, or nil when nothing is selected.
+(defun daniel-claudy--selection-bounds ()
+  "Return (BEG . END) of the selection, or nil when nothing is selected.
 Under evil the plain region lags the visual selection: it drops the character
 under point in charwise mode and ignores the linewise expansion of `V'.
 Evil's own range has both right.  Sending exits visual state, like every other
 evil visual command."
   (cond ((and (bound-and-true-p evil-local-mode) (evil-visual-state-p))
          (let ((range (evil-visual-range)))
-           (prog1 (buffer-substring-no-properties (evil-range-beginning range)
-                                                  (evil-range-end range))
+           (prog1 (cons (evil-range-beginning range) (evil-range-end range))
              (evil-exit-visual-state))))
         ((use-region-p)
-         (buffer-substring-no-properties (region-beginning) (region-end)))))
+         (cons (region-beginning) (region-end)))))
+
+(defun daniel-claudy--selection-text ()
+  "Return the selected text, or nil when nothing is selected.
+See `daniel-claudy--selection-bounds'."
+  (when-let* ((bounds (daniel-claudy--selection-bounds)))
+    (buffer-substring-no-properties (car bounds) (cdr bounds))))
+
+(defun daniel-claudy--context (beg end)
+  "Return the text from BEG to END headed by its file and line range.
+The file is named relative to the project root, so it reads the same in the
+Claude session, which runs there; a buffer visiting no file goes by its name."
+  (let* ((file (if buffer-file-name
+                   (file-relative-name buffer-file-name
+                                       (daniel-claudy--repo default-directory))
+                 (buffer-name)))
+         (first (line-number-at-pos beg))
+         ;; a linewise selection ends past its last newline, on the next line
+         (last (line-number-at-pos
+                (if (and (> end beg) (eq (char-before end) ?\n)) (1- end) end))))
+    (format "%s:%s\n```\n%s\n```"
+            file
+            (if (= first last) (number-to-string first) (format "%d-%d" first last))
+            (string-trim-right (buffer-substring-no-properties beg end) "\n+"))))
 
 (defun daniel-claudy-send-current-line ()
   "Send the current line (or the selection) to the session's herdr pane."
@@ -1024,8 +1085,14 @@ nothing.  Slash commands are not stored as prompts, so they are not watched."
   "Alist of (REPO . SESSION-ID): the Claude session each project sends to.
 REPO is a `daniel-claudy--repo' root.  `daniel-claudy-connect' fills it in, the
 first time `daniel-claudy-send-selection' runs in a project and whenever you
-ask.  herdr sessions outlive Emacs, so add this to
-`savehist-additional-variables' to keep the links across restarts.")
+ask.  herdr sessions outlive Emacs, so `savehist-mode' keeps the links across
+restarts.")
+
+;; the variable is void until savehist loads, so registering here beats asking
+;; every config to wrap the `add-to-list' itself
+(defvar savehist-additional-variables)
+(with-eval-after-load 'savehist
+  (add-to-list 'savehist-additional-variables 'daniel-claudy-project-sessions))
 
 ;;;###autoload
 (defun daniel-claudy-connect (&optional repo)
@@ -1070,6 +1137,32 @@ RECONNECT, you pick again regardless."
   (let ((text (or (daniel-claudy--selection-text)
                   (user-error "No selection to send"))))
     (daniel-claudy--send-text (daniel-claudy--project-pane reconnect) text)))
+
+(defvar daniel-claudy-command-history nil
+  "Minibuffer history of `daniel-claudy-send-command-with-context'.")
+
+;;;###autoload
+(defun daniel-claudy-send-command-with-context (bounds command &optional reconnect)
+  "Send COMMAND about the selection to the project's Claude session.
+The selection, BOUNDS as (BEG . END), goes along below it, headed by its file
+and line range (see `daniel-claudy--context'), so a question or an instruction
+about those lines needs nothing else.  Sends through the project link like
+`daniel-claudy-send-selection', RECONNECT included."
+  ;; bounds first: reading them exits visual state, and the prompt below would
+  ;; otherwise leave the region unusable if you abort it
+  (interactive
+   (let ((bounds (or (daniel-claudy--selection-bounds)
+                     (user-error "No selection to send"))))
+     (list bounds
+           (read-string "Claude, about the selection: " nil
+                        'daniel-claudy-command-history)
+           current-prefix-arg)))
+  (when (string-blank-p command)
+    (user-error "Nothing to ask"))
+  (daniel-claudy--send-text
+   (daniel-claudy--project-pane reconnect)
+   (concat (string-trim command) "\n\n"
+           (daniel-claudy--context (car bounds) (cdr bounds)))))
 
 ;;;###autoload
 (defun daniel-claudy-direct-prompt (text model)

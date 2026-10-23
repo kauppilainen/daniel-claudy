@@ -61,9 +61,6 @@ until you turn it on.
 (global-set-key (kbd "C-c a n") #'daniel-claudy-new-session)
 (global-set-key (kbd "C-c a r") #'daniel-claudy-resume-new-workspace) ; C-u: every repo
 
-;; optional: keep project -> session links across Emacs restarts
-(add-to-list 'savehist-additional-variables 'daniel-claudy-project-sessions)
-
 ;; optional: usage limits in the mode line of claudy buffers, hourly
 (run-at-time 0 3600 #'daniel-claudy-usage)
 ```
@@ -77,7 +74,28 @@ the choice in `daniel-claudy-project-sessions`; after that, every send from
 any buffer in that project goes there without asking, like a CIDER REPL
 linked to its project. It asks again only when that session is gone, or when
 you call it with a prefix argument. `daniel-claudy-connect` re-links on
-demand.
+demand. With `savehist-mode` on, the links survive Emacs restarts.
+
+`daniel-claudy-send-command-with-context` asks for a command or question in
+the minibuffer and sends it with the selection below, headed by the file
+(relative to the project root) and its line range:
+
+```
+Explain what this does.
+
+daniel-claudy.el:120-134
+` ` `
+...the selected lines...
+` ` `
+```
+
+Same project link, same prefix argument.
+
+`daniel-claudy-focus-project-session` switches herdr to the project's session
+and brings the terminal running the herdr client to the front (macOS, via
+System Events by pid, so another window of the same terminal app is never
+raised instead). `C-c C-o` in a transcript buffer does the same for that
+session.
 
 Using a custom `mode-line-format` instead of `global-mode-string`? Put the
 symbol `daniel-claudy-modeline-string` in it.
