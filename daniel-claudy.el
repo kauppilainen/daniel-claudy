@@ -359,9 +359,15 @@ it still line up."
 
 (defun daniel-claudy--live-session-files ()
   "Return the session files of Claude sessions running right now, newest first.
+A session with no transcript yet - nothing sent since it started - is listed
+first, as its bare id: claude writes the transcript on the first prompt, and
+every function taking a session file accepts the id meanwhile.
 `daniel-claudy-max-sessions' does not apply: there are only ever a handful, and
 a long-running one would otherwise fall off the end of the recent list."
-  (daniel-claudy--session-ids-files (daniel-claudy--live-session-ids)))
+  (let* ((ids (daniel-claudy--live-session-ids))
+         (files (daniel-claudy--session-ids-files ids))
+         (on-file (mapcar #'file-name-base files)))
+    (append (seq-remove (lambda (id) (member id on-file)) ids) files)))
 
 (defun daniel-claudy--typed-prompt (obj)
   "Return the first line of the prompt typed by the user in entry OBJ, or nil.
@@ -423,6 +429,12 @@ prompt and :last-prompt the most recent one.  Every key but :project may be nil.
                  (unless first-prompt (setq first-prompt prompt))
                  (setq last-prompt prompt)))
              (list cwd project name summary first-prompt last-prompt))))))
+    ;; a session with no transcript yet has no cwd on file; its live record has
+    (unless cwd
+      (when-let* ((live (alist-get 'cwd (daniel-claudy--live-record
+                                         (file-name-base file)))))
+        (setq cwd live
+              project (file-name-nondirectory (directory-file-name live)))))
     (list :cwd cwd
           :project (or project "?")
           :name name
@@ -459,6 +471,7 @@ Each label leads with the session's status symbol, then the herdr space
 hosting the session (see `daniel-claudy--space-labels'), or the project
 directory for a session running outside herdr."
   (let* ((statuses (daniel-claudy--live-session-statuses))
+         (records (daniel-claudy--live-session-records))
          ;; viewing transcripts must work without herdr
          (spaces (ignore-errors (daniel-claudy--space-labels)))
          (rows
@@ -468,7 +481,13 @@ directory for a session running outside herdr."
             (lambda (file)
               (let* ((meta (daniel-claudy--session-meta file))
                      (cwd (plist-get meta :cwd))
-                     (mtime (file-attribute-modification-time (file-attributes file))))
+                     (mtime (or (file-attribute-modification-time (file-attributes file))
+                                ;; no transcript yet: when the session started
+                                (when-let* ((ms (alist-get
+                                                 'startedAt
+                                                 (daniel-claudy--live-record
+                                                  (file-name-base file) records))))
+                                  (/ ms 1000)))))
                 (when (or (not repo)
                           (and cwd (equal (daniel-claudy--repo cwd) repo)))
                   (list file
@@ -608,6 +627,7 @@ Overlays, because markdown font-lock owns the `face' property here."
   "Render session FILE into its own buffer and display it.
 The session's buffer is reused when it is already open.  With BACKGROUND
 non-nil, render without displaying or selecting the buffer."
+  (setq file (daniel-claudy--real-file file))
   (let* ((existing (daniel-claudy--buffer-for-file file))
          (buf (or existing (generate-new-buffer (daniel-claudy--buffer-name file)))))
     (with-current-buffer buf
@@ -784,9 +804,28 @@ Each is an alist: `pane_id' is the pane, `agent_status' herdr's view of it
   (seq-filter (lambda (a) (equal (alist-get 'agent a) "claude"))
               (alist-get 'agents (daniel-claudy--herdr-result "agent" "list"))))
 
-(defun daniel-claudy--agent-session-id (agent)
-  "Return the Claude session id of herdr AGENT, or nil."
-  (alist-get 'value (alist-get 'agent_session agent)))
+(defun daniel-claudy--pane-sessions ()
+  "Return an alist of (PANE-ID . SESSION-ID) for the herdr panes running Claude.
+Matched by pid: the claude process herdr sees in a pane is the one whose record
+in `daniel-claudy-sessions-dir' names the session.  herdr's own idea of the
+session comes from a hook at startup and goes stale once claude restarts in
+the pane; the pid never does."
+  (let ((records (daniel-claudy--live-session-records)))
+    (delq nil
+          (mapcar
+           (lambda (a)
+             (let* ((pane (alist-get 'pane_id a))
+                    (pids (mapcar (lambda (p) (alist-get 'pid p))
+                                  (alist-get 'foreground_processes
+                                             (alist-get 'process_info
+                                                        (ignore-errors
+                                                          (daniel-claudy--herdr-result
+                                                           "pane" "process-info"
+                                                           "--pane" pane))))))
+                    (record (seq-find (lambda (r) (memq (alist-get 'pid r) pids))
+                                      records)))
+               (and record (cons pane (alist-get 'sessionId record)))))
+           (daniel-claudy--agents)))))
 
 (defun daniel-claudy--pane-agent (pane &optional agents)
   "Return the Claude agent record hosted by herdr PANE, or nil.
@@ -798,46 +837,50 @@ AGENTS defaults to `daniel-claudy--agents'."
   "Return non-nil if herdr PANE still exists."
   (and (ignore-errors (daniel-claudy--herdr "pane" "get" pane)) t))
 
-(defun daniel-claudy--space-labels ()
+(defun daniel-claudy--space-labels (&optional pane-sessions)
   "Return an alist of (SESSION-ID . LABEL) for the Claude sessions in herdr.
 LABEL is the herdr workspace label, the name you gave the space, with the pane
 id appended when the workspace hosts more than one Claude session: the label
-alone would not tell them apart."
+alone would not tell them apart.  PANE-SESSIONS defaults to
+`daniel-claudy--pane-sessions'; pass it in when you already have it."
   (let* ((agents (daniel-claudy--agents))
+         (pane-sessions (or pane-sessions (daniel-claudy--pane-sessions)))
          (workspaces (alist-get 'workspaces
                                 (daniel-claudy--herdr-result "workspace" "list"))))
-    (mapcar (lambda (a)
-              (let* ((ws (alist-get 'workspace_id a))
-                     (label (or (alist-get 'label
-                                           (seq-find (lambda (w)
-                                                       (equal (alist-get 'workspace_id w) ws))
-                                                     workspaces))
-                                ws))
-                     (shared (> (seq-count (lambda (b) (equal (alist-get 'workspace_id b) ws))
-                                           agents)
-                                1)))
-                (cons (daniel-claudy--agent-session-id a)
-                      (if shared (format "%s %s" label (alist-get 'pane_id a)) label))))
-            agents)))
+    (delq nil
+          (mapcar
+           (lambda (a)
+             (when-let* ((pane (alist-get 'pane_id a))
+                         (id (cdr (assoc pane pane-sessions))))
+               (let* ((ws (alist-get 'workspace_id a))
+                      (label (or (alist-get 'label
+                                            (seq-find (lambda (w)
+                                                        (equal (alist-get 'workspace_id w) ws))
+                                                      workspaces))
+                                 ws))
+                      (shared (> (seq-count (lambda (b) (equal (alist-get 'workspace_id b) ws))
+                                            agents)
+                                 1)))
+                 (cons id (if shared (format "%s %s" label pane) label)))))
+           agents))))
 
 (defun daniel-claudy--pane-choices (agents)
   "Return a (LABEL . PANE-ID) alist for AGENTS, labelled by herdr space and path."
-  (let ((spaces (daniel-claudy--space-labels)))
+  (let* ((pane-sessions (daniel-claudy--pane-sessions))
+         (spaces (daniel-claudy--space-labels pane-sessions)))
     (mapcar (lambda (a)
-              (cons (format "%-32s  %s"
-                            (or (cdr (assoc (daniel-claudy--agent-session-id a) spaces))
-                                (alist-get 'pane_id a))
-                            (alist-get 'cwd a))
-                    (alist-get 'pane_id a)))
+              (let ((pane (alist-get 'pane_id a)))
+                (cons (format "%-32s  %s"
+                              (or (cdr (assoc (cdr (assoc pane pane-sessions)) spaces))
+                                  pane)
+                              (alist-get 'cwd a))
+                      pane)))
             agents)))
 
 (defun daniel-claudy--session-pane (file)
   "Return the herdr pane id hosting session FILE, or nil when it is not running.
 FILE may also be a bare session id."
-  (let ((id (file-name-base file)))
-    (alist-get 'pane_id
-               (seq-find (lambda (a) (equal (daniel-claudy--agent-session-id a) id))
-                         (daniel-claudy--agents)))))
+  (car (rassoc (file-name-base file) (daniel-claudy--pane-sessions))))
 
 (defun daniel-claudy--select-pane ()
   "Return the herdr pane id for this session, auto-detecting or prompting.
@@ -1059,7 +1102,7 @@ A long TEXT (see `daniel-claudy--long-send-p') asks for confirmation first."
 (defun daniel-claudy--prompt-count (file line)
   "How many prompts typed in session FILE start with LINE."
   (seq-count (lambda (obj) (equal (daniel-claudy--typed-prompt obj) line))
-             (daniel-claudy--parse-file file)))
+             (daniel-claudy--parse-file (daniel-claudy--real-file file))))
 
 (defun daniel-claudy--refresh-to-bottom (buf)
   "Re-render BUF in the background and park each of its windows at the bottom.
@@ -1271,6 +1314,15 @@ the session it starts."
   "Return the transcript file of session ID, or nil when it has none yet."
   (and id (car (daniel-claudy--session-ids-files (list id)))))
 
+(defun daniel-claudy--real-file (file)
+  "Return the transcript of FILE's session once it exists, else FILE.
+A session listed before its first prompt goes by its bare id (see
+`daniel-claudy--live-session-files'); the id stands in until claude writes the
+transcript, and from then on the file is what to read."
+  (if (file-exists-p file)
+      file
+    (or (daniel-claudy--session-id-file (file-name-base file)) file)))
+
 (defun daniel-claudy--pending-buffer (pane name display)
   "Open a buffer to type the first prompt of NAME in while claude starts.
 PANE is the herdr pane it starts in.  Waiting for the transcript before
@@ -1325,7 +1377,7 @@ leaves behind is what the picker shows."
                     ;; Only worth the recursive scan once the rename is in.
                     (file (and named
                                (daniel-claudy--session-id-file
-                                (daniel-claudy--agent-session-id agent)))))
+                                (cdr (assoc pane (daniel-claudy--pane-sessions)))))))
                (cond
                 (file (cancel-timer timer)
                       (daniel-claudy--adopt-new-session buf file pane))

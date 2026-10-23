@@ -124,8 +124,12 @@ on the selection, answer pops in a buffer.
 
 ## How sending works
 
-A send goes through `herdr agent prompt`, targeting the pane whose Claude
-session id matches the transcript. That pastes bracketed, so a multi-paragraph
+A send goes through `herdr agent prompt`, targeting the pane running the
+session's Claude process. Panes are matched to sessions by pid: Claude records
+its pid in `~/.claude/sessions`, and `herdr pane process-info` lists the
+processes in each pane. Herdr's own notion of which session a pane hosts comes
+from a hook at startup and goes stale when Claude restarts in the pane; the
+pid does not. That pastes bracketed, so a multi-paragraph
 prompt arrives as one prompt. A session herdr reports as `blocked` (a
 permission or question dialog) refuses a prompt; the text is then typed raw
 into the pane with Enter, which is how you answer such a dialog anyway.
