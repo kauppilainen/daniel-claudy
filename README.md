@@ -1,13 +1,13 @@
 # daniel-claudy
 
-Read Claude Code sessions in Emacs and send prompts to them through tmux.
+Read Claude Code sessions in Emacs and send prompts to them through
+[herdr](https://herdr.dev).
 
-> **Not maintained.** Some colleagues liked this, so I'm making it public for
-> anyone who wants it. I don't have time to maintain it: no support, no fixes,
-> no reviewed PRs. Fork it, use it and change it as you like (MIT). Adapting it
-> to your setup is easy these days: fork it and ask an AI to do it.
+> A fork of [danielhvs/daniel-claudy](https://github.com/danielhvs/daniel-claudy)
+> with the tmux layer swapped for herdr. The upstream is not maintained; neither
+> is this. Fork it, use it and change it as you like (MIT).
 
-See every feature in screenshots: [claudy-tour](https://danielhvs.github.io/daniel-claudy/daniel-claudy-tour.html).
+See every feature in screenshots (tmux-era, same keys): [claudy-tour](https://danielhvs.github.io/daniel-claudy/daniel-claudy-tour.html).
 
 Put `daniel-claudy.el` in `~/.emacs.d/daniel-claudy/`, then:
 
@@ -25,12 +25,14 @@ transcript, `C-c C-c`.
 
 ## Requirements
 
-1. Linux (a session counts as live while `/proc/PID` exists).
-2. Emacs 29.1+.
-3. `markdown-mode` 2.5+.
-4. `tmux`, with Claude running inside it - needed to send, focus, start and
-   resume sessions. Viewing transcripts works without it.
-5. The `claude` CLI on `PATH`.
+1. Emacs 29.1+.
+2. `markdown-mode` 2.5+.
+3. `herdr` on `PATH` with its server running and the Claude integration
+   installed (`herdr integration install claude`): that is what tells herdr
+   which Claude session each pane hosts, and claudy looks panes up by session
+   id. Needed to send, focus, start and resume sessions. Viewing transcripts
+   works without it.
+4. The `claude` CLI on `PATH`.
 
 ## Install
 
@@ -54,9 +56,9 @@ until you turn it on.
 
 ;; global keys - pick your own
 (global-set-key (kbd "C-c a v") #'daniel-claudy-view)            ; C-u: every recent session
-(global-set-key (kbd "C-c a s") #'daniel-claudy-tmux-send-selection)
+(global-set-key (kbd "C-c a s") #'daniel-claudy-send-selection)
 (global-set-key (kbd "C-c a n") #'daniel-claudy-new-session)
-(global-set-key (kbd "C-c a r") #'daniel-claudy-resume-new-window) ; C-u: every repo
+(global-set-key (kbd "C-c a r") #'daniel-claudy-resume-new-workspace) ; C-u: every repo
 
 ;; optional: usage limits in the mode line of claudy buffers, hourly
 (run-at-time 0 3600 #'daniel-claudy-usage)
@@ -69,12 +71,12 @@ symbol `daniel-claudy-modeline-string` in it.
 
 | Key       | Command                               | Does                                          |
 |-----------|---------------------------------------|-----------------------------------------------|
-| `C-c C-c` | `daniel-claudy-tmux-send-rest`        | send the selection, or this line to end of buffer |
-| `C-c C-l` | `daniel-claudy-tmux-send-current-line`| send the current line (or selection)          |
+| `C-c C-c` | `daniel-claudy-send-rest`             | send the selection, or this line to end of buffer |
+| `C-c C-l` | `daniel-claudy-send-current-line`     | send the current line (or selection)          |
 | `C-c C-a` | `daniel-claudy-refresh`               | re-render, park on Claude's latest answer     |
 | `C-c C-j` | `daniel-claudy-jump-to-question`      | re-render, park on your latest prompt         |
 | `C-c C-t` | `daniel-claudy-toggle-tool-lines`     | show/hide `[tool: ...]` lines                 |
-| `C-c C-o` | `daniel-claudy-tmux-focus-pane`       | switch tmux to the session's pane             |
+| `C-c C-o` | `daniel-claudy-focus-pane`            | focus the session's pane in herdr             |
 | `C-c C-r` | `daniel-claudy-resume`                | `/resume` another session in this pane (C-u: every repo) |
 | `C-c C-u` | `daniel-claudy-usage`                 | fetch usage limits via `claude -p /usage`     |
 | `C-c C-k` | `daniel-claudy-exit-this-session`     | `/exit` the session (asks first)              |
@@ -84,6 +86,18 @@ same chords; the buffer is a transcript, not a document you edit.
 
 Also available: `daniel-claudy-direct-prompt` - one-off `claude -p` question
 on the selection, answer pops in a buffer.
+
+## How sending works
+
+A send goes through `herdr agent prompt`, targeting the pane whose Claude
+session id matches the transcript. That pastes bracketed, so a multi-paragraph
+prompt arrives as one prompt. A session herdr reports as `blocked` (a
+permission or question dialog) refuses a prompt; the text is then typed raw
+into the pane with Enter, which is how you answer such a dialog anyway.
+
+A new session (`daniel-claudy-new-session`, or typing an unknown name in
+`daniel-claudy-view`) opens a new herdr workspace in the project you pick,
+labelled with the session name, and runs `claude` in its root pane.
 
 ## Optional: auto-refresh when Claude finishes
 
@@ -109,15 +123,6 @@ the turn ended, so the transcript re-renders on its own:
 ```
 
 Needs `jq` and a running Emacs server (`M-x server-start`).
-
-## Optional: status glyphs in tmux window names
-
-`claude-tmux-rename.sh` (sent along with this file) names each tmux window after its Claude session, prefixed with the same
-status glyph. Wire it in `~/.tmux.conf`:
-
-```
-set -g status-right "#(/path/to/claude-tmux-rename.sh)"
-```
 
 ## Settings
 

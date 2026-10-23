@@ -7,19 +7,17 @@
 
 ;;; Commentary:
 
-;; A viewer for Claude Code sessions, plus a loop to talk to them through tmux.
+;; A viewer for Claude Code sessions, plus a loop to talk to them through herdr.
 ;; Claude stores every session as a newline-delimited JSON file under
 ;; `daniel-claudy-projects-dir'.  `daniel-claudy-view' picks a session and
 ;; renders it as markdown in its own `*claudy: PROJECT - TITLE*' buffer
 ;; (`daniel-claudy-mode').  Type a prompt under the transcript and
-;; `daniel-claudy-tmux-send-rest' pastes it into the tmux pane running that
+;; `daniel-claudy-send-rest' pastes it into the herdr pane running that
 ;; session.
 ;;
 ;; Loading this file only defines things.  Opt in to the modeline segment with
 ;; `(daniel-claudy-modeline-mode 1)' and add `daniel-claudy-modeline-string' to
 ;; `global-mode-string' or `mode-line-format'.
-;;
-;; Linux only: a session counts as live while /proc/PID exists.
 
 ;;; Code:
 
@@ -116,8 +114,8 @@ Each check rescans `daniel-claudy-projects-dir', so this is not free."
 (defvar-local daniel-claudy--current-file nil
   "Session file backing this claudy buffer, for refreshing.")
 
-(defvar-local daniel-claudy--tmux-pane nil
-  "tmux pane id running the Claude session shown in this claudy buffer.")
+(defvar-local daniel-claudy--pane nil
+  "herdr pane id running the Claude session shown in this claudy buffer.")
 
 (defvar-local daniel-claudy--status-shown nil
   "Status symbol last appended at the bottom of this claudy buffer.
@@ -128,8 +126,8 @@ permanent local.")
   "Non-nil to drop `[tool: ...]' lines when rendering this buffer.
 Toggled by `daniel-claudy-toggle-tool-lines'.")
 
-(defvar-local daniel-claudy--pending-window nil
-  "tmux window of the session this buffer waits on, before it has a transcript.")
+(defvar-local daniel-claudy--pending-pane nil
+  "herdr pane of the session this buffer waits on, before it has a transcript.")
 
 (defvar-local daniel-claudy--queued nil
   "Prompt a send took before the session was up, sent once it is.")
@@ -142,13 +140,13 @@ typing.")
 
 (defvar-local daniel-claudy--awaiting nil
   "Non-nil when a send from this buffer awaits Claude finishing.
-Armed by `daniel-claudy-tmux-send-rest' and cleared by
+Armed by `daniel-claudy-send-rest' and cleared by
 `daniel-claudy-notify-finished', which the Claude Code Stop hook calls.")
 
 ;; Re-rendering a session calls `daniel-claudy-mode', which kills buffer-local
 ;; variables; the per-session state must survive that.
 (dolist (var '(daniel-claudy--current-file
-               daniel-claudy--tmux-pane
+               daniel-claudy--pane
                daniel-claudy--awaiting
                daniel-claudy-hide-tool-lines))
   (put var 'permanent-local t))
@@ -329,7 +327,7 @@ does not count as live."
                                                    :false-object nil))))
                       (pid (alist-get 'pid json)))
                  (and (numberp pid)
-                      (file-exists-p (format "/proc/%d" pid))
+                      (process-attributes pid)
                       json)))
              (directory-files dir t "\\.json\\'"))))))
 
@@ -656,10 +654,10 @@ Typing text no session matches starts a new session named after it."
      ;; nothing.
      ((null file) (daniel-claudy-new-session choice))
      ;; A session waiting on an answer wants the terminal, not the transcript:
-     ;; render it out of sight and hand the frame straight to tmux.
+     ;; render it out of sight and hand the frame straight to herdr.
      ((equal (daniel-claudy--session-status file) "waiting")
       (with-current-buffer (daniel-claudy--render file 'background)
-        (daniel-claudy-tmux-focus-pane)))
+        (daniel-claudy-focus-pane)))
      (t
       ;; Always re-render: a live session has grown since it was last opened.
       ;; A buffer you already read keeps its point; only a fresh one parks on
@@ -743,130 +741,142 @@ hand it over in whatever state was current when it fired."
   (daniel-claudy--render daniel-claudy--current-file)
   (message "Tool lines %s" (if daniel-claudy-hide-tool-lines "hidden" "shown")))
 
-;;;; tmux integration ----------------------------------------------------------
+;;;; herdr integration ---------------------------------------------------------
 ;;
-;; A Claude session always runs inside a tmux pane, in the session's cwd.  These
-;; commands let you type in the claudy buffer and shoot lines straight into
-;; that pane.  The pane is discovered from the session's live record, else by
-;; matching its current path against the session cwd, and remembered
-;; buffer-locally; you are only prompted when the match is ambiguous (or gone).
+;; A Claude session always runs inside a herdr pane, in the session's cwd.
+;; These commands let you type in the claudy buffer and shoot lines straight
+;; into that pane.  herdr's Claude integration reports each session id to the
+;; pane hosting it, so the pane is looked up by session id and remembered
+;; buffer-locally; you are only prompted when the session is not running (or
+;; has since moved).
 
-(defun daniel-claudy--tmux-panes ()
-  "Return every tmux pane as a plist of :id :path :cmd :window and a :label."
-  (delq nil
-        (mapcar
-         (lambda (line)
-           (pcase (split-string line "\t")
-             (`(,id ,path ,cmd ,loc ,window)
-              (list :id id :path path :cmd cmd :window window
-                    :label (format "%-6s  %-12s  %-24s  %s" id cmd loc path)))))
-         (ignore-errors
-           (process-lines
-            "tmux" "list-panes" "-a" "-F"
-            (concat "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}\t"
-                    "#{session_name}:#{window_index}.#{pane_index}\t"
-                    "#{window_name}"))))))
+(defun daniel-claudy--herdr (&rest args)
+  "Run `herdr ARGS' and return its output.
+Signal a `user-error' carrying herdr's error JSON when it fails."
+  (with-temp-buffer
+    (let ((status (apply #'call-process "herdr" nil t nil args)))
+      (if (eq status 0)
+          (buffer-string)
+        (user-error "herdr %s: %s" (string-join args " ")
+                    (string-trim (buffer-string)))))))
 
-(defun daniel-claudy--tmux-pane-live-p (id)
-  "Return non-nil if a tmux pane with ID currently exists."
-  (seq-find (lambda (p) (equal (plist-get p :id) id))
-            (daniel-claudy--tmux-panes)))
+(defun daniel-claudy--herdr-result (&rest args)
+  "Return the `result' of `herdr ARGS', a JSON-printing command, as an alist."
+  (alist-get 'result
+             (json-parse-string (apply #'daniel-claudy--herdr args)
+                                :object-type 'alist :array-type 'list
+                                :null-object nil :false-object nil)))
 
-(defun daniel-claudy--pane-choices (panes)
-  "Return a (LABEL . PANE-ID) alist for PANES, labelled by window name and path.
-The window name carries the session name, which is what tells two sessions in
-one directory apart; pane ids and window indexes do not."
-  (mapcar (lambda (p) (cons (format "%-24s  %s"
-                                    (plist-get p :window)
-                                    (plist-get p :path))
-                            (plist-get p :id)))
-          panes))
+(defun daniel-claudy--agents ()
+  "Return the herdr agent records of the panes running Claude Code.
+Each is an alist: `pane_id' is the pane, `agent_status' herdr's view of it
+\(idle, working, blocked, done) and `agent_session' holds the Claude session id."
+  (seq-filter (lambda (a) (equal (alist-get 'agent a) "claude"))
+              (alist-get 'agents (daniel-claudy--herdr-result "agent" "list"))))
 
-(defun daniel-claudy--session-tmux-pane (file)
-  "Return the tmux pane id Claude recorded for session FILE, when it is live.
-Claude writes `session:@window.%pane' into the session record, which pins the
-pane exactly - cwd matching cannot, once two sessions share a directory.  Nil
-when the session is not running, started outside tmux, or has since moved."
-  (let* ((id (file-name-base file))
-         (record (seq-find (lambda (r) (equal (alist-get 'sessionId r) id))
-                           (daniel-claudy--live-session-records)))
-         (tmux (alist-get 'tmux record))
-         (pane (and (stringp tmux)
-                    (string-match "\\(%[0-9]+\\)\\'" tmux)
-                    (match-string 1 tmux))))
-    (and pane (daniel-claudy--tmux-pane-live-p pane) pane)))
+(defun daniel-claudy--agent-session-id (agent)
+  "Return the Claude session id of herdr AGENT, or nil."
+  (alist-get 'value (alist-get 'agent_session agent)))
 
-(defun daniel-claudy--tmux-select-pane ()
-  "Return the tmux pane id for this session, auto-detecting or prompting.
-Panes whose current path matches the session cwd are preferred; a unique match
-is used without asking."
-  (let* ((panes (daniel-claudy--tmux-panes))
+(defun daniel-claudy--pane-agent (pane &optional agents)
+  "Return the Claude agent record hosted by herdr PANE, or nil.
+AGENTS defaults to `daniel-claudy--agents'."
+  (seq-find (lambda (a) (equal (alist-get 'pane_id a) pane))
+            (or agents (daniel-claudy--agents))))
+
+(defun daniel-claudy--pane-live-p (pane)
+  "Return non-nil if herdr PANE still exists."
+  (and (ignore-errors (daniel-claudy--herdr "pane" "get" pane)) t))
+
+(defun daniel-claudy--pane-choices (agents)
+  "Return a (LABEL . PANE-ID) alist for AGENTS, labelled by session name and path.
+The session name is what tells two sessions in one directory apart; pane ids
+do not."
+  (let ((records (daniel-claudy--live-session-records)))
+    (mapcar (lambda (a)
+              (cons (format "%-24s  %s"
+                            (or (alist-get 'name
+                                           (daniel-claudy--live-record
+                                            (daniel-claudy--agent-session-id a)
+                                            records))
+                                (alist-get 'pane_id a))
+                            (alist-get 'cwd a))
+                    (alist-get 'pane_id a)))
+            agents)))
+
+(defun daniel-claudy--session-pane (file)
+  "Return the herdr pane id hosting session FILE, or nil when it is not running."
+  (let ((id (file-name-base file)))
+    (alist-get 'pane_id
+               (seq-find (lambda (a) (equal (daniel-claudy--agent-session-id a) id))
+                         (daniel-claudy--agents)))))
+
+(defun daniel-claudy--select-pane ()
+  "Return the herdr pane id for this session, auto-detecting or prompting.
+Claude panes whose cwd matches the session cwd are preferred; a unique match is
+used without asking."
+  (let* ((agents (daniel-claudy--agents))
          (cwd (and daniel-claudy--current-file
                    (daniel-claudy--session-cwd daniel-claudy--current-file)))
          (cwd (and cwd (directory-file-name (expand-file-name cwd))))
          (matches (and cwd
                        (seq-filter
-                        (lambda (p)
+                        (lambda (a)
                           (equal (directory-file-name
-                                  (expand-file-name (plist-get p :path)))
+                                  (expand-file-name (alist-get 'cwd a)))
                                  cwd))
-                        panes))))
+                        agents))))
     (cond
-     ((null panes) (user-error "No tmux panes found (is tmux running?)"))
-     ((= (length matches) 1) (plist-get (car matches) :id))
-     (t (let* ((table (daniel-claudy--pane-choices (or matches panes)))
-               (choice (completing-read "tmux pane for this session: "
+     ((null agents) (user-error "No herdr pane runs Claude (is herdr running?)"))
+     ((= (length matches) 1) (alist-get 'pane_id (car matches)))
+     (t (let* ((table (daniel-claudy--pane-choices (or matches agents)))
+               (choice (completing-read "herdr pane for this session: "
                                         table nil t)))
           (cdr (assoc choice table)))))))
 
-(defun daniel-claudy--tmux-pane ()
-  "Return this buffer's tmux pane id, (re)discovering it when needed.
-The session's own record wins over the cache: a cached pane can be alive and
-still wrong, once that session exited and another claude took its pane."
-  (setq daniel-claudy--tmux-pane
+(defun daniel-claudy--pane ()
+  "Return this buffer's herdr pane id, (re)discovering it when needed.
+herdr's own record wins over the cache: a cached pane can be alive and still
+wrong, once that session exited and another claude took its pane."
+  (setq daniel-claudy--pane
         (or (and daniel-claudy--current-file
-                 (daniel-claudy--session-tmux-pane daniel-claudy--current-file))
-            (and daniel-claudy--tmux-pane
-                 (daniel-claudy--tmux-pane-live-p daniel-claudy--tmux-pane)
-                 daniel-claudy--tmux-pane)
-            (daniel-claudy--tmux-select-pane))))
+                 (daniel-claudy--session-pane daniel-claudy--current-file))
+            (and daniel-claudy--pane
+                 (daniel-claudy--pane-live-p daniel-claudy--pane)
+                 daniel-claudy--pane)
+            (daniel-claudy--select-pane))))
 
-(defun daniel-claudy--tmux-pane-field (pane field)
-  "Return tmux format FIELD (e.g. \"session_name\") for PANE, or nil."
-  (car (ignore-errors
-         (process-lines "tmux" "display-message" "-p" "-t" pane
-                        (concat "#{" field "}")))))
-
-(defun daniel-claudy-tmux-focus-pane ()
-  "Focus the session's tmux session, window and pane.
-Switches the attached tmux client; bringing the terminal itself to the front
-is up to your window manager."
+(defun daniel-claudy-focus-pane ()
+  "Focus the session's herdr workspace, tab and pane.
+Switches the herdr client; bringing the terminal itself to the front is up to
+your window manager."
   (interactive)
-  (let* ((pane (daniel-claudy--tmux-pane))
-         (session (daniel-claudy--tmux-pane-field pane "session_name")))
-    (when session
-      (call-process "tmux" nil nil nil "switch-client" "-t" session))
-    (call-process "tmux" nil nil nil "select-window" "-t" pane)
-    (call-process "tmux" nil nil nil "select-pane" "-t" pane)))
+  (daniel-claudy--herdr "agent" "focus" (daniel-claudy--pane)))
 
-(defun daniel-claudy--tmux-send-text (pane text &optional quiet)
-  "Bracket-paste TEXT into tmux PANE and submit it with Enter.
-A bracketed paste (rather than literal key presses) keeps any embedded newlines
-in Claude's prompt instead of submitting at the first one.  With QUIET, say
-nothing: a send you did not type does not belong in the echo area."
+(defun daniel-claudy--send-text (pane text &optional quiet)
+  "Submit TEXT to the Claude session in herdr PANE.
+`herdr agent prompt' pastes it bracketed, so embedded newlines stay in Claude's
+prompt instead of submitting at the first one, and follows with Enter.  A
+session blocked on a question refuses a prompt; the answer is typed there raw,
+as you would.  With QUIET, say nothing: a send you did not type does not belong
+in the echo area."
   (setq text (string-trim text))
   (when (string-empty-p text)
     (user-error "Nothing to send"))
-  ;; a prompt ending in `@path' leaves Claude's file picker open, and it eats
-  ;; the Enter; the trailing space closes the picker and Claude trims it
-  (call-process "tmux" nil nil nil "set-buffer" "--" (concat text " "))
-  (call-process "tmux" nil nil nil "paste-buffer" "-dpr" "-t" pane)
-  ;; an `@image.png' in the paste keeps Claude busy reading it, and an Enter
-  ;; landing meanwhile is dropped
-  (sleep-for 0.2)
-  (call-process "tmux" nil nil nil "send-keys" "-t" pane "Enter")
+  ;; ponytail: text and Enter go as one submission, so an `@image.png' Claude is
+  ;; still reading when the Enter lands may drop it; split into `pane send-text'
+  ;; plus a delayed `send-keys enter' if that bites
+  (condition-case err
+      ;; a prompt ending in `@path' leaves Claude's file picker open, and it
+      ;; eats the Enter; the trailing space closes the picker and Claude trims it
+      (daniel-claudy--herdr "agent" "prompt" pane (concat text " "))
+    (user-error
+     (unless (string-match-p "agent_blocked" (cadr err))
+       (signal (car err) (cdr err)))
+     (daniel-claudy--herdr "pane" "send-text" pane text)
+     (daniel-claudy--herdr "pane" "send-keys" pane "enter")))
   (unless quiet
-    (message "Sent to tmux %s:\n%s" pane text)))
+    (message "Sent to herdr %s:\n%s" pane text)))
 
 (defun daniel-claudy--selection-text ()
   "Return the selected text, or nil when nothing is selected.
@@ -882,11 +892,11 @@ evil visual command."
         ((use-region-p)
          (buffer-substring-no-properties (region-beginning) (region-end)))))
 
-(defun daniel-claudy-tmux-send-current-line ()
-  "Send the current line (or the selection) to the session's tmux pane."
+(defun daniel-claudy-send-current-line ()
+  "Send the current line (or the selection) to the session's herdr pane."
   (interactive)
-  (daniel-claudy--tmux-send-text
-   (daniel-claudy--tmux-pane)
+  (daniel-claudy--send-text
+   (daniel-claudy--pane)
    (or (daniel-claudy--selection-text)
        (buffer-substring-no-properties
         (line-beginning-position) (line-end-position)))))
@@ -906,8 +916,8 @@ a line that is nothing but a glyph goes; a glyph you typed inside a line of
 your own stays."
   (replace-regexp-in-string daniel-claudy--status-trail-re "" text))
 
-(defun daniel-claudy-tmux-send-rest ()
-  "Send the selection, or everything from point down, to the session's tmux pane.
+(defun daniel-claudy-send-rest ()
+  "Send the selection, or everything from point down, to the session's herdr pane.
 A prompt written over several paragraphs goes in one send, not one paragraph at
 a time.  Arms `daniel-claudy--awaiting' so the buffer auto-refreshes once
 Claude's Stop hook reports the turn finished (see
@@ -935,7 +945,7 @@ Claude's Stop hook reports the turn finished (see
                       (string-join (last words 8) " "))))))
 
 (defun daniel-claudy--send (text)
-  "Send TEXT to the session's tmux pane, as `daniel-claudy-tmux-send-rest' does.
+  "Send TEXT to the session's herdr pane, as `daniel-claudy-send-rest' does.
 Queues it while a new session starts; otherwise sends it and arms
 `daniel-claudy--awaiting' (a queued prompt is armed once
 `daniel-claudy--adopt-new-session' sends it).
@@ -943,18 +953,18 @@ A long TEXT (see `daniel-claudy--long-send-p') asks for confirmation first."
   (when (and (daniel-claudy--long-send-p text)
              (not (y-or-n-p (daniel-claudy--long-send-prompt text))))
     (user-error "Not sent"))
-  (if (and daniel-claudy--pending-window (not daniel-claudy--pending-file))
+  (if (and daniel-claudy--pending-pane (not daniel-claudy--pending-file))
       (progn
         (when (string-blank-p text) (user-error "Nothing to send"))
         (setq daniel-claudy--queued (string-trim text))
         (message "Queued: sends once claude is up"))
-    (let ((pane (or daniel-claudy--pending-window (daniel-claudy--tmux-pane))))
+    (let ((pane (or daniel-claudy--pending-pane (daniel-claudy--pane))))
       (when daniel-claudy--pending-file
         (setq daniel-claudy--current-file daniel-claudy--pending-file
               daniel-claudy--pending-file nil
-              daniel-claudy--pending-window nil))
+              daniel-claudy--pending-pane nil))
       (daniel-claudy--refresh-when-landed (current-buffer) text)
-      (daniel-claudy--tmux-send-text pane text))
+      (daniel-claudy--send-text pane text))
     (setq daniel-claudy--awaiting t)))
 
 (defun daniel-claudy--prompt-count (file line)
@@ -981,7 +991,7 @@ Windows stay as they are: you may be typing the next prompt."
   "Re-render BUF once the prompt TEXT shows up in its transcript.
 Call it before sending: it counts the matching prompts already there, so
 sending the same prompt twice still waits for the new one.  Claude writes the
-prompt a moment after tmux hands it over, and a render before that proves
+prompt a moment after herdr hands it over, and a render before that proves
 nothing.  Slash commands are not stored as prompts, so they are not watched."
   (when-let* ((line (car (split-string (string-trim text) "\n" t)))
               ((not (string-prefix-p "/" line)))
@@ -1004,30 +1014,24 @@ nothing.  Slash commands are not stored as prompts, so they are not watched."
                  (message "Claude: prompt not in the transcript after %ss"
                           daniel-claudy-landed-timeout)))))))))
 
-(defun daniel-claudy--tmux-claude-panes ()
-  "Return the tmux panes currently running Claude Code."
-  (seq-filter (lambda (p) (equal (plist-get p :cmd) "claude"))
-              (daniel-claudy--tmux-panes)))
-
 ;;;###autoload
-(defun daniel-claudy-tmux-send-selection ()
-  "Send the selection to a tmux window running Claude, chosen by name.
-The global counterpart of `daniel-claudy-tmux-send-rest': it works in any
-buffer, so there is no session cwd to match a pane against and you always pick
-the target window yourself."
+(defun daniel-claudy-send-selection ()
+  "Send the selection to a herdr pane running Claude, chosen by session name.
+The global counterpart of `daniel-claudy-send-rest': it works in any buffer, so
+there is no session cwd to match a pane against and you always pick the target
+yourself."
   (interactive)
   ;; text first: reading the selection exits visual state, and the prompt below
   ;; would otherwise leave the region unusable if you abort it
   (let* ((text (or (daniel-claudy--selection-text)
                    (user-error "No selection to send")))
-         (table (append (daniel-claudy--pane-choices
-                         (daniel-claudy--tmux-claude-panes))
+         (table (append (daniel-claudy--pane-choices (daniel-claudy--agents))
                         '(("+ new session" . new-session))))
-         (target (cdr (assoc (completing-read "tmux claude window: " table nil t)
+         (target (cdr (assoc (completing-read "herdr claude pane: " table nil t)
                              table))))
     (pcase target
       ('new-session (daniel-claudy-new-session nil text))
-      (_ (daniel-claudy--tmux-send-text target text)))))
+      (_ (daniel-claudy--send-text target text)))))
 
 ;;;###autoload
 (defun daniel-claudy-direct-prompt (text model)
@@ -1071,7 +1075,7 @@ alias, haiku by default.  Runs in `daniel-claudy-direct-prompt-directory'."
 ;;;; Starting a new session -----------------------------------------------------
 
 ;; The picker can only show sessions that exist.  When the one you want does not,
-;; the miss becomes the way to create it: pick a project, get a tmux window
+;; the miss becomes the way to create it: pick a project, get a herdr workspace
 ;; running claude there, and open its transcript once it registers.
 
 (defun daniel-claudy--read-project-dir ()
@@ -1086,75 +1090,50 @@ Offers the projects `project' knows about; with none known, any directory."
   "Read the name for a new session.
 No default: the name is what tells two sessions in one project apart, and a
 directory basename is the one thing it never needs to say.  Read before the
-tmux window exists, so refusing an empty one leaves nothing behind."
+herdr workspace exists, so refusing an empty one leaves nothing behind."
   (let ((name (string-trim (read-string "Session name: "))))
     (if (string-empty-p name)
         (user-error "A session needs a name")
       name)))
 
-(defun daniel-claudy--tmux-current-session ()
-  "Return the name of the attached tmux session, or the first one."
-  (or (car (ignore-errors
-             (process-lines "tmux" "list-sessions" "-F" "#{session_name}"
-                            "-f" "#{session_attached}")))
-      (car (ignore-errors
-             (process-lines "tmux" "list-sessions" "-F" "#{session_name}")))
-      (user-error "No tmux session found (is tmux running?)")))
-
-(defun daniel-claudy--tmux-new-claude-window (dir &rest args)
-  "Open a tmux window running claude ARGS in DIR, return its `session:@window' id.
-`-P -F' makes tmux hand back the new window, which is what lets
-`daniel-claudy--await-new-session' find the session it starts."
-  (or (car (ignore-errors
-             (apply #'process-lines "tmux" "new-window"
-                    "-t" (daniel-claudy--tmux-current-session)
-                    "-c" (expand-file-name dir)
-                    "-P" "-F" "#{session_name}:#{window_id}"
-                    "claude" args)))
-      (user-error "tmux refused to open a window in %s" dir)))
-
-(defun daniel-claudy--window-session-record (window)
-  "Return the live session record of the Claude session in tmux WINDOW, or nil.
-Cheap: it reads the handful of files in `daniel-claudy-sessions-dir'."
-  (let ((prefix (concat window ".")))
-    (seq-find (lambda (r)
-                (let ((tmux (alist-get 'tmux r)))
-                  (and (stringp tmux) (string-prefix-p prefix tmux))))
-              (daniel-claudy--live-session-records))))
+(defun daniel-claudy--new-claude-pane (dir label &rest args)
+  "Open a herdr workspace in DIR, run claude ARGS in it, return its pane id.
+One workspace per session, labelled LABEL when given.  `workspace create' hands
+back the root pane, which is what lets `daniel-claudy--await-new-session' find
+the session it starts."
+  (let ((pane (alist-get 'pane_id
+                         (alist-get 'root_pane
+                                    (apply #'daniel-claudy--herdr-result
+                                           "workspace" "create" "--focus"
+                                           "--cwd" (expand-file-name dir)
+                                           (and label (list "--label" label)))))))
+    (daniel-claudy--herdr "pane" "run" pane
+                          (combine-and-quote-strings (cons "claude" args)))
+    pane))
 
 (defun daniel-claudy--session-id-file (id)
   "Return the transcript file of session ID, or nil when it has none yet."
   (and id (car (daniel-claudy--session-ids-files (list id)))))
 
-(defun daniel-claudy--tmux-window-live-p (window)
-  "Return non-nil if tmux WINDOW (a `session:@id' target) still exists.
-Listed and matched rather than asked about: `display-message -t' silently
-answers for the current window when the target is gone."
-  (and (member window
-               (ignore-errors
-                 (process-lines "tmux" "list-windows" "-a" "-F"
-                                "#{session_name}:#{window_id}")))
-       t))
-
-(defun daniel-claudy--pending-buffer (window name display)
+(defun daniel-claudy--pending-buffer (pane name display)
   "Open a buffer to type the first prompt of NAME in while claude starts.
-WINDOW is the tmux window it starts in.  Waiting for the transcript before
+PANE is the herdr pane it starts in.  Waiting for the transcript before
 showing anything leaves you staring at nothing through the whole boot.
 DISPLAY nil keeps the buffer in the background."
   (let ((buf (generate-new-buffer (format "*claudy: new - %s*" name))))
     (with-current-buffer buf
       (daniel-claudy-mode)
-      (insert (format "### new session: %s (starting in tmux %s)\n\n" name window))
+      (insert (format "### new session: %s (starting in herdr %s)\n\n" name pane))
       (daniel-claudy--band-headers)
-      (setq daniel-claudy--pending-window window))
+      (setq daniel-claudy--pending-pane pane))
     (when display
       (daniel-claudy--display buf)
       (when (bound-and-true-p evil-local-mode) (evil-insert-state)))
     buf))
 
-(defun daniel-claudy--adopt-new-session (buf file window)
+(defun daniel-claudy--adopt-new-session (buf file pane)
   "Turn BUF, typed in while the session started, into FILE's claudy buffer.
-A prompt queued there goes to tmux WINDOW now.  BUF keeps its windows: you
+A prompt queued there goes to herdr PANE now.  BUF keeps its windows: you
 may be mid-sentence.  With nothing queued BUF is left alone until your first
 send."
   (cond
@@ -1170,46 +1149,46 @@ send."
         ;; lets `daniel-claudy--render' find BUF
         (setq daniel-claudy--current-file file)
         (daniel-claudy--refresh-when-landed buf queued)
-        (daniel-claudy--tmux-send-text window queued)
+        (daniel-claudy--send-text pane queued)
         (setq daniel-claudy--awaiting t)
         (daniel-claudy--refresh-to-bottom buf))))))
 
-(defun daniel-claudy--await-new-session (window name buf)
-  "Name the session starting in tmux WINDOW, then turn BUF into its transcript.
+(defun daniel-claudy--await-new-session (pane name buf)
+  "Name the session starting in herdr PANE, then turn BUF into its transcript.
 Naming it is what makes the transcript exist: claude writes nothing under
 `daniel-claudy-projects-dir' until something happens in the session, and
 `/rename' is the cheapest something there is - no model call, and the name it
-leaves behind is what the picker and the tmux window title show."
+leaves behind is what the picker shows."
   (let ((waited 0) (named nil) timer)
     (setq timer
           (run-with-timer
            daniel-claudy-new-session-poll daniel-claudy-new-session-poll
            (lambda ()
              (setq waited (+ waited daniel-claudy-new-session-poll))
-             (let* ((record (daniel-claudy--window-session-record window))
+             (let* ((agent (daniel-claudy--pane-agent pane))
                     ;; Only worth the recursive scan once the rename is in.
                     (file (and named
                                (daniel-claudy--session-id-file
-                                (alist-get 'sessionId record)))))
+                                (daniel-claudy--agent-session-id agent)))))
                (cond
                 (file (cancel-timer timer)
-                      (daniel-claudy--adopt-new-session buf file window))
-                ((not (daniel-claudy--tmux-window-live-p window))
+                      (daniel-claudy--adopt-new-session buf file pane))
+                ((not (daniel-claudy--pane-live-p pane))
                  (cancel-timer timer)
-                 (message "tmux %s closed before its session started" window))
+                 (message "herdr pane %s closed before its session started" pane))
                 ;; `idle' means the TUI is up and past any trust prompt; sending
                 ;; earlier would answer that prompt instead of naming the session.
-                ((and (not named) (equal (alist-get 'status record) "idle"))
+                ((and (not named) (equal (alist-get 'agent_status agent) "idle"))
                  (setq named t)
-                 (daniel-claudy--tmux-send-text window (concat "/rename " name) t))
+                 (daniel-claudy--send-text pane (concat "/rename " name) t))
                 ((>= waited daniel-claudy-new-session-timeout)
                  (cancel-timer timer)
-                 (message "tmux %s never came up; answer what it is asking there"
-                          window)))))))))
+                 (message "herdr pane %s never came up; answer what it is asking there"
+                          pane)))))))))
 
 ;;;###autoload
 (defun daniel-claudy-new-session (&optional name prompt dir)
-  "Start claude in a new tmux window and open its transcript buffer.
+  "Start claude in a new herdr workspace and open its transcript buffer.
 NAME names the session; you are asked for one when it is missing or blank.
 `daniel-claudy-view' passes the text that matched no session, so the search
 that found nothing is already the name you meant to give it.
@@ -1221,52 +1200,50 @@ Return the new buffer."
   (let* ((name (or (and name (not (string-blank-p name)) (string-trim name))
                    (daniel-claudy--read-session-name)))
          (dir (or dir (daniel-claudy--read-project-dir)))
-         (window (daniel-claudy--tmux-new-claude-window dir))
+         (pane (daniel-claudy--new-claude-pane dir name))
          ;; a queued prompt comes from a selection you are still working on
-         (buf (daniel-claudy--pending-buffer window name (not prompt))))
+         (buf (daniel-claudy--pending-buffer pane name (not prompt))))
     (when prompt
       (with-current-buffer buf
         (insert (string-trim prompt))
         (setq daniel-claudy--queued (string-trim prompt))))
-    (daniel-claudy--await-new-session window name buf)
-    (message "Started claude \"%s\" in tmux %s (%s)" name window dir)
+    (daniel-claudy--await-new-session pane name buf)
+    (message "Started claude \"%s\" in herdr %s (%s)" name pane dir)
     buf))
 
-(defun daniel-claudy--tmux-exit (pane &optional tries)
-  "Send `/exit' to tmux PANE and answer the worktree dialog with Remove.
+(defun daniel-claudy--exit (pane &optional tries)
+  "Send `/exit' to herdr PANE and answer the worktree dialog with Remove.
 Claude asks keep-or-remove when the session sits in a worktree and has no
 setting to skip that; the dialog shows a moment after `/exit', so poll the pane
 for it.  TRIES counts the polls left."
   (if (null tries)
-      (progn (daniel-claudy--tmux-send-text pane "/exit")
-             (run-with-timer 0.3 nil #'daniel-claudy--tmux-exit pane 20))
+      (progn (daniel-claudy--send-text pane "/exit")
+             (run-with-timer 0.3 nil #'daniel-claudy--exit pane 20))
     ;; a gone pane means the session ended without asking: no worktree
-    (let ((screen (with-temp-buffer
-                    (when (zerop (call-process "tmux" nil t nil "capture-pane"
-                                               "-p" "-t" pane))
-                      (buffer-string)))))
+    (let ((screen (ignore-errors
+                    (daniel-claudy--herdr "pane" "read" pane "--source" "visible"))))
       (cond ((null screen))
             ((string-match-p "Exiting worktree session" screen)
-             (call-process "tmux" nil nil nil "send-keys" "-t" pane "2"))
+             (daniel-claudy--herdr "pane" "send-keys" pane "2"))
             ((> tries 1)
-             (run-with-timer 0.3 nil #'daniel-claudy--tmux-exit pane (1- tries)))))))
+             (run-with-timer 0.3 nil #'daniel-claudy--exit pane (1- tries)))))))
 
 (defun daniel-claudy-exit-this-session ()
-  "Send `/exit' to this buffer's tmux pane, ending the Claude session.
+  "Send `/exit' to this buffer's herdr pane, ending the Claude session.
 Asks first: the session is gone for good."
   (interactive)
   (when (y-or-n-p "Exit this Claude session? ")
-    (daniel-claudy--tmux-exit (daniel-claudy--tmux-pane))
+    (daniel-claudy--exit (daniel-claudy--pane))
     (kill-current-buffer)))
 
 (defun daniel-claudy-resume (&optional all)
-  "Send `/resume' to this buffer's tmux pane and show the session it picks up.
+  "Send `/resume' to this buffer's herdr pane and show the session it picks up.
 Offers the recent sessions of this git repo, its subdirs and worktrees
 included, or of every repo when ALL is non-nil.  No `/clear' first: `/resume'
 leaves the current conversation saved and listed, and `/clear' would only start
 one more empty session."
   (interactive "P")
-  (let* ((pane (daniel-claudy--tmux-pane))
+  (let* ((pane (daniel-claudy--pane))
          (current daniel-claudy--current-file)
          (repo (unless all
                  (daniel-claudy--repo (or (and current
@@ -1276,33 +1253,32 @@ one more empty session."
                             (daniel-claudy--candidates t repo)))
          (file (cdr (assoc (completing-read "Resume session: " table nil t)
                            table))))
-    (daniel-claudy--tmux-send-text pane (concat "/resume " (file-name-base file)) t)
+    (daniel-claudy--send-text pane (concat "/resume " (file-name-base file)) t)
     (kill-current-buffer)
     (let ((buf (daniel-claudy--render file)))
       ;; the resumed session's record names this pane only once claude has
       ;; switched, so until then the pane lookup would have to ask
       (with-current-buffer buf
-        (setq daniel-claudy--tmux-pane pane))
+        (setq daniel-claudy--pane pane))
       (daniel-claudy--display buf))))
 
 ;;;###autoload
-(defun daniel-claudy-resume-new-window (&optional all)
-  "Resume a recent session of this git repo in a new tmux window and show it.
+(defun daniel-claudy-resume-new-workspace (&optional all)
+  "Resume a recent session of this git repo in a new herdr workspace and show it.
 `daniel-claudy-resume' from any buffer: the same picker, or every repo's
-sessions when ALL is non-nil.  The window starts in the session's own
+sessions when ALL is non-nil.  The workspace starts in the session's own
 directory, the only place `claude --resume' finds it."
   (interactive "P")
   (let* ((table (daniel-claudy--candidates
                  t (unless all (daniel-claudy--repo default-directory))))
          (file (cdr (assoc (completing-read "Resume session: " table nil t)
                            table)))
-         (window (daniel-claudy--tmux-new-claude-window
-                  (daniel-claudy--session-cwd file)
-                  "--resume" (file-name-base file)))
+         (pane (daniel-claudy--new-claude-pane
+                (daniel-claudy--session-cwd file) nil
+                "--resume" (file-name-base file)))
          (buf (daniel-claudy--render file)))
     (with-current-buffer buf
-      (setq daniel-claudy--tmux-pane
-            (daniel-claudy--tmux-pane-field window "pane_id")))
+      (setq daniel-claudy--pane pane))
     (daniel-claudy--display buf)))
 
 (defun daniel-claudy--refresh-to-end (buf)
@@ -1320,7 +1296,7 @@ directory, the only place `claude --resume' finds it."
 (defun daniel-claudy-notify-finished (&optional file)
   "Refresh the claudy buffer showing session FILE when a turn finishes.
 The Claude Code Stop hook calls this via emacsclient with the transcript path;
-only the matching buffer refreshes, and only if `daniel-claudy-tmux-send-rest'
+only the matching buffer refreshes, and only if `daniel-claudy-send-rest'
 armed it, so unrelated sessions do not trigger anything.  Without FILE, every
 awaiting claudy buffer refreshes.  Refreshing happens in the background so a
 finished session never steals the selected window."
@@ -1338,7 +1314,7 @@ finished session never steals the selected window."
 ;;;; Usage ---------------------------------------------------------------------
 
 ;; `/usage' lives inside a session, but `claude -p' runs it headless and prints
-;; the same block.  Parsing that beats scraping the tmux pane.
+;; the same block.  Parsing that beats scraping the herdr pane.
 
 (defconst daniel-claudy--usage-line-re
   (concat "^Current \\([a-z]+\\)\\(?: ([^)]*)\\)?: +\\([0-9]+\\)% used"
@@ -1448,12 +1424,12 @@ is worse than the mode line updating late."
 
 (defvar-keymap daniel-claudy-mode-map
   :doc "Keymap for `daniel-claudy-mode'."
-  "C-c C-c" #'daniel-claudy-tmux-send-rest
-  "C-c C-l" #'daniel-claudy-tmux-send-current-line
+  "C-c C-c" #'daniel-claudy-send-rest
+  "C-c C-l" #'daniel-claudy-send-current-line
   "C-c C-a" #'daniel-claudy-refresh
   "C-c C-j" #'daniel-claudy-jump-to-question
   "C-c C-t" #'daniel-claudy-toggle-tool-lines
-  "C-c C-o" #'daniel-claudy-tmux-focus-pane
+  "C-c C-o" #'daniel-claudy-focus-pane
   "C-c C-r" #'daniel-claudy-resume
   "C-c C-u" #'daniel-claudy-usage
   "C-c C-k" #'daniel-claudy-exit-this-session)
