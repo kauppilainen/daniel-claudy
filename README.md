@@ -56,13 +56,28 @@ until you turn it on.
 
 ;; global keys - pick your own
 (global-set-key (kbd "C-c a v") #'daniel-claudy-view)            ; C-u: every recent session
-(global-set-key (kbd "C-c a s") #'daniel-claudy-send-selection)
+(global-set-key (kbd "C-c a s") #'daniel-claudy-send-selection)  ; C-u: pick the session again
+(global-set-key (kbd "C-c a c") #'daniel-claudy-connect)
 (global-set-key (kbd "C-c a n") #'daniel-claudy-new-session)
 (global-set-key (kbd "C-c a r") #'daniel-claudy-resume-new-workspace) ; C-u: every repo
+
+;; optional: keep project -> session links across Emacs restarts
+(add-to-list 'savehist-additional-variables 'daniel-claudy-project-sessions)
 
 ;; optional: usage limits in the mode line of claudy buffers, hourly
 (run-at-time 0 3600 #'daniel-claudy-usage)
 ```
+
+## Sending from any buffer
+
+`daniel-claudy-send-selection` sends the selection to the Claude session
+linked to the current project (the git root, as `project.el` sees it). The
+first send from a project asks you to pick a running session and remembers
+the choice in `daniel-claudy-project-sessions`; after that, every send from
+any buffer in that project goes there without asking, like a CIDER REPL
+linked to its project. It asks again only when that session is gone, or when
+you call it with a prefix argument. `daniel-claudy-connect` re-links on
+demand.
 
 Using a custom `mode-line-format` instead of `global-mode-string`? Put the
 symbol `daniel-claudy-modeline-string` in it.

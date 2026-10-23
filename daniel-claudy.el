@@ -627,6 +627,15 @@ non-nil, render without displaying or selecting the buffer."
     (unless background (daniel-claudy--display buf))
     buf))
 
+(defun daniel-claudy--session-table (candidates)
+  "Return a completion table over CANDIDATES, an alist of (LABEL . FILE).
+It keeps the alist order in the completion UI: newest first."
+  (lambda (string pred action)
+    (if (eq action 'metadata)
+        '(metadata (category . daniel-claudy-session)
+                   (display-sort-function . identity))
+      (complete-with-action action candidates string pred))))
+
 ;;;###autoload
 (defun daniel-claudy-view (&optional all)
   "Pick a running Claude session and view its transcript.
@@ -634,12 +643,7 @@ With a prefix argument, ALL, pick from every recent session instead.
 Typing text no session matches starts a new session named after it."
   (interactive "P")
   (let* ((candidates (daniel-claudy--candidates all))
-         ;; Preserve newest-first order in the completion UI.
-         (table (lambda (string pred action)
-                  (if (eq action 'metadata)
-                      '(metadata (category . daniel-claudy-session)
-                                 (display-sort-function . identity))
-                    (complete-with-action action candidates string pred))))
+         (table (daniel-claudy--session-table candidates))
          ;; No `require-match': a miss is the way in to a new session, not a
          ;; dead end.
          (choice (and candidates
@@ -805,7 +809,8 @@ do not."
             agents)))
 
 (defun daniel-claudy--session-pane (file)
-  "Return the herdr pane id hosting session FILE, or nil when it is not running."
+  "Return the herdr pane id hosting session FILE, or nil when it is not running.
+FILE may also be a bare session id."
   (let ((id (file-name-base file)))
     (alist-get 'pane_id
                (seq-find (lambda (a) (equal (daniel-claudy--agent-session-id a) id))
@@ -1015,23 +1020,56 @@ nothing.  Slash commands are not stored as prompts, so they are not watched."
                           daniel-claudy-landed-timeout)))))))))
 
 ;;;###autoload
-(defun daniel-claudy-send-selection ()
-  "Send the selection to a herdr pane running Claude, chosen by session name.
-The global counterpart of `daniel-claudy-send-rest': it works in any buffer, so
-there is no session cwd to match a pane against and you always pick the target
-yourself."
+(defvar daniel-claudy-project-sessions nil
+  "Alist of (REPO . SESSION-ID): the Claude session each project sends to.
+REPO is a `daniel-claudy--repo' root.  `daniel-claudy-connect' fills it in, the
+first time `daniel-claudy-send-selection' runs in a project and whenever you
+ask.  herdr sessions outlive Emacs, so add this to
+`savehist-additional-variables' to keep the links across restarts.")
+
+;;;###autoload
+(defun daniel-claudy-connect (&optional repo)
+  "Link the current project to a running Claude session; return its id.
+Every `daniel-claudy-send-selection' from inside the project then goes there,
+until that session ends or you connect again.  REPO is the project root,
+`daniel-claudy--repo' of `default-directory' by default."
   (interactive)
+  (let* ((repo (or repo (daniel-claudy--repo default-directory)))
+         (candidates (or (daniel-claudy--candidates)
+                         (user-error "No Claude session is running")))
+         (choice (completing-read
+                  (format "Claude session for %s: " (abbreviate-file-name repo))
+                  (daniel-claudy--session-table candidates) nil t))
+         (file (cdr (assoc choice candidates))))
+    (setf (alist-get repo daniel-claudy-project-sessions nil nil #'equal)
+          (file-name-base file))
+    (message "Sends from %s go to %s" (abbreviate-file-name repo)
+             (daniel-claudy--meta-label (daniel-claudy--session-meta file) file))
+    (file-name-base file)))
+
+(defun daniel-claudy--project-pane (&optional reconnect)
+  "Return the herdr pane of the session linked to the current project.
+Connects first (see `daniel-claudy-connect') when the project has no link yet,
+when its session is no longer running, or when RECONNECT is non-nil."
+  (let* ((repo (daniel-claudy--repo default-directory))
+         (id (cdr (assoc repo daniel-claudy-project-sessions))))
+    (or (and id (not reconnect) (daniel-claudy--session-pane id))
+        (daniel-claudy--session-pane (daniel-claudy-connect repo))
+        (user-error "That session runs outside herdr; nowhere to send"))))
+
+;;;###autoload
+(defun daniel-claudy-send-selection (&optional reconnect)
+  "Send the selection to the Claude session linked to the current project.
+The global counterpart of `daniel-claudy-send-rest': it works in any buffer.
+A project with no link yet, or whose session is gone, asks you to pick one
+first and remembers it (see `daniel-claudy-connect'); with a prefix argument,
+RECONNECT, you pick again regardless."
+  (interactive "P")
   ;; text first: reading the selection exits visual state, and the prompt below
   ;; would otherwise leave the region unusable if you abort it
-  (let* ((text (or (daniel-claudy--selection-text)
-                   (user-error "No selection to send")))
-         (table (append (daniel-claudy--pane-choices (daniel-claudy--agents))
-                        '(("+ new session" . new-session))))
-         (target (cdr (assoc (completing-read "herdr claude pane: " table nil t)
-                             table))))
-    (pcase target
-      ('new-session (daniel-claudy-new-session nil text))
-      (_ (daniel-claudy--send-text target text)))))
+  (let ((text (or (daniel-claudy--selection-text)
+                  (user-error "No selection to send"))))
+    (daniel-claudy--send-text (daniel-claudy--project-pane reconnect) text)))
 
 ;;;###autoload
 (defun daniel-claudy-direct-prompt (text model)
