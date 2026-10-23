@@ -455,8 +455,12 @@ Waiting sessions come first, then idle ones, then busy and shell ones, each
 group newest first.
 Only sessions running right now, or every recent session when ALL is non-nil.
 With REPO, only the sessions started inside that `daniel-claudy--repo'.
-Each label leads with the session's status symbol."
+Each label leads with the session's status symbol, then the herdr space
+hosting the session (see `daniel-claudy--space-labels'), or the project
+directory for a session running outside herdr."
   (let* ((statuses (daniel-claudy--live-session-statuses))
+         ;; viewing transcripts must work without herdr
+         (spaces (ignore-errors (daniel-claudy--space-labels)))
          (rows
           (delq
            nil
@@ -471,7 +475,9 @@ Each label leads with the session's status symbol."
                         (daniel-claudy--status-symbol
                          (cdr (assoc (file-name-base file) statuses)))
                         (truncate-string-to-width
-                         (plist-get meta :project) 24 nil nil "…")
+                         (or (cdr (assoc (file-name-base file) spaces))
+                             (plist-get meta :project))
+                         32 nil nil "…")
                         (truncate-string-to-width
                          (or (plist-get meta :name) "-") 30 nil nil "…")
                         (or (plist-get meta :last-prompt) "(no prompt yet)")
@@ -792,17 +798,34 @@ AGENTS defaults to `daniel-claudy--agents'."
   "Return non-nil if herdr PANE still exists."
   (and (ignore-errors (daniel-claudy--herdr "pane" "get" pane)) t))
 
-(defun daniel-claudy--pane-choices (agents)
-  "Return a (LABEL . PANE-ID) alist for AGENTS, labelled by session name and path.
-The session name is what tells two sessions in one directory apart; pane ids
-do not."
-  (let ((records (daniel-claudy--live-session-records)))
+(defun daniel-claudy--space-labels ()
+  "Return an alist of (SESSION-ID . LABEL) for the Claude sessions in herdr.
+LABEL is the herdr workspace label, the name you gave the space, with the pane
+id appended when the workspace hosts more than one Claude session: the label
+alone would not tell them apart."
+  (let* ((agents (daniel-claudy--agents))
+         (workspaces (alist-get 'workspaces
+                                (daniel-claudy--herdr-result "workspace" "list"))))
     (mapcar (lambda (a)
-              (cons (format "%-24s  %s"
-                            (or (alist-get 'name
-                                           (daniel-claudy--live-record
-                                            (daniel-claudy--agent-session-id a)
-                                            records))
+              (let* ((ws (alist-get 'workspace_id a))
+                     (label (or (alist-get 'label
+                                           (seq-find (lambda (w)
+                                                       (equal (alist-get 'workspace_id w) ws))
+                                                     workspaces))
+                                ws))
+                     (shared (> (seq-count (lambda (b) (equal (alist-get 'workspace_id b) ws))
+                                           agents)
+                                1)))
+                (cons (daniel-claudy--agent-session-id a)
+                      (if shared (format "%s %s" label (alist-get 'pane_id a)) label))))
+            agents)))
+
+(defun daniel-claudy--pane-choices (agents)
+  "Return a (LABEL . PANE-ID) alist for AGENTS, labelled by herdr space and path."
+  (let ((spaces (daniel-claudy--space-labels)))
+    (mapcar (lambda (a)
+              (cons (format "%-32s  %s"
+                            (or (cdr (assoc (daniel-claudy--agent-session-id a) spaces))
                                 (alist-get 'pane_id a))
                             (alist-get 'cwd a))
                     (alist-get 'pane_id a)))
@@ -1111,7 +1134,9 @@ until that session ends or you connect again.  REPO is the project root,
     (setf (alist-get repo daniel-claudy-project-sessions nil nil #'equal)
           (file-name-base file))
     (message "Sends from %s go to %s" (abbreviate-file-name repo)
-             (daniel-claudy--meta-label (daniel-claudy--session-meta file) file))
+             (or (cdr (assoc (file-name-base file)
+                             (ignore-errors (daniel-claudy--space-labels))))
+                 (daniel-claudy--meta-label (daniel-claudy--session-meta file) file)))
     (file-name-base file)))
 
 (defun daniel-claudy--project-pane (&optional reconnect)

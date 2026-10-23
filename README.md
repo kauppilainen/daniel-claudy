@@ -69,7 +69,9 @@ until you turn it on.
 
 `daniel-claudy-send-selection` sends the selection to the Claude session
 linked to the current project (the git root, as `project.el` sees it). The
-first send from a project asks you to pick a running session and remembers
+first send from a project asks you to pick a running session, listed by the
+herdr workspace label you gave the space (plus the pane id when a workspace
+hosts two Claude sessions), and remembers
 the choice in `daniel-claudy-project-sessions`; after that, every send from
 any buffer in that project goes there without asking, like a CIDER REPL
 linked to its project. It asks again only when that session is gone, or when
